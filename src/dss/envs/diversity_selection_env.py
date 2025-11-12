@@ -61,6 +61,39 @@ class OnlineCovTrace:
         self.cov_mat = np.zeros((self.emb_dim, self.emb_dim), dtype=np.float32)
 
 
+class OnlineCosineDiversity:
+    """
+    Online computation of mean cosine distance for diversity tracking.
+    """
+    def __init__(self, d: int):
+        self.d = d
+        self.t = 0
+        self.sum_vec = np.zeros(d, dtype=np.float32)
+
+    def add(self, x: np.ndarray):
+        """
+        Add a new sample to the online mean cosine distance computation.
+        
+        Args:
+            x: Sample vector of shape (d,)
+        """
+        x = x.astype(np.float32)
+        self.t += 1
+        self.sum_vec += x
+
+    @property
+    def mean_cosine_distance(self) -> float:
+        """
+        Compute mean cosine distance
+        """
+        if self.t <= 1:
+            return 0.0
+        t = float(self.t)
+        s2 = float(np.dot(self.sum_vec, self.sum_vec))
+        mean_sim = (s2 - t) / (t * (t - 1))
+        return 1.0 - mean_sim
+
+
 class DiversitySelectionEnv(gym.Env):
     """
     Gymnasium environment for diversity-based data selection.
@@ -81,7 +114,7 @@ class DiversitySelectionEnv(gym.Env):
     Uses OnlineCovTrace for efficient online covariance computation.
     """
     
-    def __init__(self, X_embed: np.ndarray, M: int, seed: int | None = None):
+    def __init__(self, X_embed: np.ndarray, M: int, d_metric: str | None = None, seed: int | None = None, maximize: bool = True):
         """
         Initialize the diversity selection environment.
         
@@ -112,31 +145,8 @@ class DiversitySelectionEnv(gym.Env):
         self.selected = None             # Indices of selected data points
         self.div_tracker = None          # Online diversity tracker
         self.cur_idx = None              # Current candidate index
-    
-    def reset(self, seed: int | None = None, options=None):
-        """
-        Reset the environment to initial state.
-        
-        Returns:
-            obs: First candidate observation
-            info: Empty dict
-        """
-        super().reset(seed=seed)
-        
-        # Reset episode state
-        self.pool = np.arange(self.N)
-        self.selected = []
-        self.div_tracker = OnlineCovTrace(d=self.d)
-        self.cur_idx = None
-        self.cur_pos = None
-        self.cum_reward = 0.0
-        
-        # Sample first candidate
-        obs = self._sample_next()
-        if obs is None:
-            obs = np.zeros(self.d, dtype=np.float32)
-        
-        return obs.astype(np.float32), {}
+        self.d_metric = d_metric         # Distance metric: covar. trace vs. mean cos. dist.
+        self.maximize = maximize         # Maximize diversity, or minimize diversity (max. similarity)
     
     def _sample_next(self):
         """
@@ -153,6 +163,31 @@ class DiversitySelectionEnv(gym.Env):
         self.cur_idx = int(self.pool[self.cur_pos])
         
         return self.X[self.cur_idx]
+
+    def reset(self, seed: int | None = None, options=None):
+        """
+        Reset the environment to initial state.
+        
+        Returns:
+            obs: First candidate observation
+            info: Empty dict
+        """
+        super().reset(seed=seed)
+        
+        # Reset episode state
+        self.pool = np.arange(self.N)
+        self.selected = []
+        self.div_tracker = OnlineCosineDiversity(d=self.d) if self.d_metric == "cos" else OnlineCovTrace(d=self.d)
+        self.cur_idx = None
+        self.cur_pos = None
+        self.cum_reward = 0.0
+        
+        # Sample first candidate
+        obs = self._sample_next()
+        if obs is None:
+            obs = np.zeros(self.d, dtype=np.float32)
+        
+        return obs.astype(np.float32), {}
     
     def step(self, action: int):
         """
@@ -172,17 +207,20 @@ class DiversitySelectionEnv(gym.Env):
         
         if action == 1:  # Include current candidate
             # Compute marginal diversity gain
-            prev_diversity = self.div_tracker.trace_cov_unbiased
+            prev_diversity = self.div_tracker.mean_cosine_distance if self.d_metric == "cos" else self.div_tracker.trace_cov_unbiased
             self.div_tracker.add(self.X[self.cur_idx])
             self.selected.append(self.cur_idx)
-            reward = self.div_tracker.trace_cov_unbiased - prev_diversity
+            new_diversity = self.div_tracker.mean_cosine_distance if self.d_metric == "cos" else self.div_tracker.trace_cov_unbiased
+            reward = new_diversity - prev_diversity
+            if not self.maximize:
+                reward = -reward
             self.cum_reward += float(reward)
         
-        # Remove from pool (swap with last and pop) - we've seen this item
-        if self.pool.size > 0 and self.cur_pos < self.pool.size:
-            last = self.pool[-1]
-            self.pool[self.cur_pos] = last
-            self.pool = self.pool[:-1]
+            # Remove from pool (swap with last and pop) - we've seen this item
+            if self.pool.size > 0 and self.cur_pos < self.pool.size:
+                last = self.pool[-1]
+                self.pool[self.cur_pos] = last
+                self.pool = self.pool[:-1]
         
         # Check termination: M items selected or pool exhausted
         terminated = (len(self.selected) >= self.M) or (self.pool.size == 0)
@@ -192,11 +230,13 @@ class DiversitySelectionEnv(gym.Env):
             obs = np.zeros(self.d, dtype=np.float32)
             info = {
                 "selected_idx": np.array(self.selected, dtype=np.int32),
-                "final_trace_pop": self.div_tracker.trace_cov_pop,
-                "final_trace_unbiased": self.div_tracker.trace_cov_unbiased,
                 "cum_reward": self.cum_reward,
                 "num_selected": len(self.selected),
             }
+            if self.d_metric == "cos":
+                info["d_metric"] = self.div_tracker.mean_cosine_distance
+            else:
+                info["d_metric"] = self.div_tracker.trace_cov_unbiased
             return obs, float(reward), True, False, info
         
         # Sample next candidate
