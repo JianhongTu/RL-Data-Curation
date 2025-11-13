@@ -31,3 +31,35 @@ def evaluate(size_percents, N, X_unit, model_max, model_min):
     results_rand = np.array(results_rand)
 
     return results_max, results_min, results_rand
+
+import numpy as np
+
+def evaluate_ppov1(size_percents, N, X_unit, ppo_v1_max, ppo_v1_min):
+    results_ppov1_max = []
+    results_ppov1_min = []
+
+    for pct in size_percents:
+        M = int(pct / 100 * N)
+        print(f"=== PPOv1 Size {pct}% (M={M}) ===")
+
+        # Most diverse subset
+        idx_max, _ = ppo_v1_max.score_and_rank_inference(
+            X_embed=X_unit,
+            k=M,
+            minimize=False,
+        )
+
+        # Least diverse subset
+        idx_min, _ = ppo_v1_min.score_and_rank_inference(
+            X_embed=X_unit,
+            k=M,
+            minimize=True,
+        )
+
+        m_ppov1_max = mean_cosine_distance_for_indices(X_unit, idx_max)
+        m_ppov1_min = mean_cosine_distance_for_indices(X_unit, idx_min)
+
+        results_ppov1_max.append(m_ppov1_max)
+        results_ppov1_min.append(m_ppov1_min)
+
+    return np.array(results_ppov1_max, dtype=np.float32), np.array(results_ppov1_min, dtype=np.float32)

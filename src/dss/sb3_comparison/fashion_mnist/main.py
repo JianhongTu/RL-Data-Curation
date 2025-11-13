@@ -5,8 +5,11 @@ from wandb.integration.sb3 import WandbCallback
 from envs.diversity_selection_env import DiversitySelectionEnv
 from .embeddings import build_fashion_mnist_embeddings
 from stable_baselines3 import PPO
-from ..eval import evaluate
+from ..eval import evaluate, evaluate_ppov1
 from ..plot import plot_results
+from policies.ppov1 import PPOv1, PPOv1Config
+from compare_ppo_versions import SingleEnvWrapper
+import torch
 
 def main():
     X_embed, y = build_fashion_mnist_embeddings()
@@ -18,14 +21,31 @@ def main():
     models_dir = here / "model"
     models_dir.mkdir(exist_ok=True)
 
-    max_path = models_dir / "sb3_ppo_max"
-    min_path = models_dir / "sb3_ppo_min"
+    max_path = models_dir / "sb3_ppo_max.zip"
+    min_path = models_dir / "sb3_ppo_min.zip"
+
+    custom_max_path = models_dir / "ppov1_max"
+    custom_min_path = models_dir / "ppov1_min"
 
     N = len(X_embed)
     M_train = int(0.2 * N)
     env_max = DiversitySelectionEnv(X_embed=X_unit, d_metric="trace", M=M_train, seed=42)
     env_min = DiversitySelectionEnv(X_embed=X_unit, M=M_train, d_metric="trace", seed=42, maximize=False)
-    
+    env_max_v1 = SingleEnvWrapper(DiversitySelectionEnv(
+        X_embed=X_unit,
+        d_metric="trace",
+        M=M_train,
+        seed=42,          # or 43, doesn't matter much
+    ))
+
+    env_min_v1 = SingleEnvWrapper(DiversitySelectionEnv(
+        X_embed=X_unit,
+        d_metric="trace",
+        M=M_train,
+        seed=42,
+        maximize=False,
+    ))
+
     if max_path.exists() and min_path.exists():
         print("Found existing models, loading from disk...")
         model_max = PPO.load(max_path, env=env_max)
@@ -77,11 +97,87 @@ def main():
 
         run.finish()
 
+    if custom_max_path.exists() and custom_min_path.exists():
+        print("Found existing PPOv1 models, loading from disk...")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        config_v1 = PPOv1Config()
+        ppov1_max = PPOv1(envs=env_max_v1, config=config_v1, device=device)
+        ppov1_min = PPOv1(envs=env_min_v1, config=config_v1, device=device)
+        ppov1_max.load(custom_max_path)
+        ppov1_min.load(custom_min_path)
+    else:
+        print("No saved models found, training from scratch...")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        config_v1 = PPOv1Config()  # uses the paper-aligned defaults
+
+        # Create PPOv1 agents
+        ppov1_max = PPOv1(envs=env_max_v1, config=config_v1, device=device)
+        ppov1_min = PPOv1(envs=env_min_v1, config=config_v1, device=device)
+
+        # Initial obs/flags for each env
+        next_obs_max, info_max = env_max_v1.reset()
+        next_obs_max = torch.tensor(next_obs_max, device=device, dtype=torch.float32)
+        next_term_max = torch.zeros(env_max_v1.num_envs, device=device)
+        next_trunc_max = torch.zeros(env_max_v1.num_envs, device=device)
+
+        next_obs_min, info_min = env_min_v1.reset()
+        next_obs_min = torch.tensor(next_obs_min, device=device, dtype=torch.float32)
+        next_term_min = torch.zeros(env_min_v1.num_envs, device=device)
+        next_trunc_min = torch.zeros(env_min_v1.num_envs, device=device)
+
+        # How many PPO updates to reach TOTAL_TIMESTEPS?
+        steps_per_update = config_v1.num_steps * env_max_v1.num_envs
+        num_updates = TOTAL_TIMESTEPS // steps_per_update
+
+        global_step_max = 0
+        global_step_min = 0
+
+        for update in range(1, num_updates + 1):
+            # Optional: anneal LR
+            ppov1_max.anneal_learning_rate(update, num_updates)
+            ppov1_min.anneal_learning_rate(update, num_updates)
+
+            # --- MAX agent rollout + update ---
+            next_obs_max, next_term_max, next_trunc_max, _, global_step_max = ppov1_max.rollout(
+                next_obs_max,
+                next_term_max,
+                next_trunc_max,
+                global_step_max,
+            )
+            adv_max, ret_max = ppov1_max.compute_advantages_and_returns(
+                next_obs_max, next_term_max, next_trunc_max
+            )
+            metrics_max = ppov1_max.update(adv_max, ret_max)
+
+            # --- MIN agent rollout + update ---
+            next_obs_min, next_term_min, next_trunc_min, _, global_step_min = ppov1_min.rollout(
+                next_obs_min,
+                next_term_min,
+                next_trunc_min,
+                global_step_min,
+            )
+            adv_min, ret_min = ppov1_min.compute_advantages_and_returns(
+                next_obs_min, next_term_min, next_trunc_min
+            )
+            metrics_min = ppov1_min.update(adv_min, ret_min)
+
+            # (Optional) print basic progress
+            if update % 10 == 0 or update == 1:
+                print(
+                    f"Update {update}/{num_updates} | "
+                    f"Max EV={metrics_max['explained_variance']:.3f} | "
+                    f"Min EV={metrics_min['explained_variance']:.3f}"
+                )
+
+        # Save PPOv1 models
+        ppov1_max.save(custom_max_path)
+        ppov1_min.save(custom_min_path)
+
     size_percents = [2, 5, 10, 15, 20, 25, 30, 40, 50]
 
     results_max, results_min, results_rand = evaluate(size_percents, N, X_unit, model_max, model_min)
-
-    plot_results(size_percents, results_max, results_min, results_rand, "fashion_mnist_plot.png")
+    results_max_ppov1, results_min_ppov1 = evaluate_ppov1(size_percents, N, X_unit, ppov1_max, ppov1_min)
+    plot_results(size_percents, results_max, results_min, results_rand, "fashion_mnist_plot.png", results_max_ppov1, results_min_ppov1)
 
 if __name__ == "__main__":
     main()

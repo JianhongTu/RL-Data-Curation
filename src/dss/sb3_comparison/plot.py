@@ -1,12 +1,25 @@
 import matplotlib.pyplot as plt
 
 
-def plot_results(size_percents, results_max, results_min, results_rand, save_path=None):
+def plot_results(
+    size_percents,
+    results_max,
+    results_min,
+    results_rand,
+    filename=None,
+    results_ppov1_max=None,
+    results_ppov1_min=None,
+):
     plt.figure(figsize=(6,4))
-    plt.plot(size_percents, results_max,  marker="o", label="Maximize (RL)")
-    plt.plot(size_percents, results_min,  marker="o", label="Minimize (RL)")
+    plt.plot(size_percents, results_max,  marker="o", label="SB3 Maximize (RL)")
+    plt.plot(size_percents, results_min,  marker="o", label="SB3 Minimize (RL)")
     plt.plot(size_percents, results_rand, marker="o", label="Random")
-    # plt.plot(size_percents, results_dpp,  marker="o", label="Greedy DPP")  # when ready
+
+    if results_ppov1_max is not None:
+        plt.plot(size_percents, results_ppov1_max, marker="o", label="PPOv1 Maximize")
+
+    if results_ppov1_min is not None:
+        plt.plot(size_percents, results_ppov1_min, marker="o", label="PPOv1 Minimize")
 
     plt.xlabel("Size (%)")
     plt.ylabel("Mean Cosine Distance")
@@ -15,7 +28,6 @@ def plot_results(size_percents, results_max, results_min, results_rand, save_pat
     plt.grid(True)
     plt.tight_layout()
 
-    if save_path is not None:
-        plt.savefig(save_path, dpi=300, bbox_inches="tight")
-        
+    if filename is not None:
+        plt.savefig(filename, dpi=300)
     plt.show()
