@@ -53,7 +53,7 @@ def evaluate_ppov1(size_percents, N, X_unit, ppo_v1_max, ppo_v1_min):
         idx_min, _ = ppo_v1_min.score_and_rank_inference(
             X_embed=X_unit,
             k=M,
-            minimize=True,
+            minimize=False,
         )
 
         m_ppov1_max = mean_cosine_distance_for_indices(X_unit, idx_max)

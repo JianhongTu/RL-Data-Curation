@@ -24,9 +24,9 @@ class PPOv1Config:
     learning_rate: float = 3e-4
     num_steps: int = 2048              # Paper: 2048
     anneal_lr: bool = True
-    gae: bool = False                   # Paper: λ=0 means no GAE
-    gamma: float = 1.0                  # Paper: 1.0 (no discounting)
-    gae_lambda: float = 0.0             # Paper: 0.0 (no GAE)
+    gae: bool = True                   # Paper: λ=0 means no GAE
+    gamma: float = 0.99                  # Paper: 1.0 (no discounting)
+    gae_lambda: float = 0.95             # Paper: 0.0 (no GAE)
     update_epochs: int = 10             # Paper: 10
     minibatch_size: int = 64            # Paper: 64
     clip_coef: float = 0.2
