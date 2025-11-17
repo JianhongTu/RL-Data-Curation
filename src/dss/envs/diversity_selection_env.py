@@ -114,7 +114,16 @@ class DiversitySelectionEnv(gym.Env):
     Uses OnlineCovTrace for efficient online covariance computation.
     """
     
-    def __init__(self, X_embed: np.ndarray, M: int, d_metric: str | None = None, seed: int | None = None, maximize: bool = True):
+    def __init__(
+        self,
+        X_embed: np.ndarray,
+        M: int,
+        d_metric: str | None = None,
+        seed: int | None = None,
+        maximize: bool = True,
+        max_steps: int | None = None,
+        reward_scale: float | None = None,
+    ):
         """
         Initialize the diversity selection environment.
         
@@ -147,6 +156,9 @@ class DiversitySelectionEnv(gym.Env):
         self.cur_idx = None              # Current candidate index
         self.d_metric = d_metric         # Distance metric: covar. trace vs. mean cos. dist.
         self.maximize = maximize         # Maximize diversity, or minimize diversity (max. similarity)
+        self.max_steps = max_steps       # Optional cap on episode length (steps)
+        self.reward_scale = reward_scale
+        self.step_count = 0
     
     def _sample_next(self):
         """
@@ -181,6 +193,7 @@ class DiversitySelectionEnv(gym.Env):
         self.cur_idx = None
         self.cur_pos = None
         self.cum_reward = 0.0
+        self.step_count = 0
         
         # Sample first candidate
         obs = self._sample_next()
@@ -204,6 +217,7 @@ class DiversitySelectionEnv(gym.Env):
             info: Dict with episode info (only on termination)
         """
         reward = 0.0
+        self.step_count += 1
         
         if action == 1:  # Include current candidate
             # Compute marginal diversity gain
@@ -214,30 +228,37 @@ class DiversitySelectionEnv(gym.Env):
             reward = new_diversity - prev_diversity
             if not self.maximize:
                 reward = -reward
+            if self.reward_scale is not None and self.reward_scale > 0:
+                reward /= self.reward_scale
             self.cum_reward += float(reward)
-        
-            # Remove from pool (swap with last and pop) - we've seen this item
-            if self.pool.size > 0 and self.cur_pos < self.pool.size:
-                last = self.pool[-1]
-                self.pool[self.cur_pos] = last
-                self.pool = self.pool[:-1]
+
+        # Remove current candidate from pool regardless of action (sample without replacement)
+        if self.pool.size > 0:
+            # swap current position with last element and pop
+            last = self.pool[-1]
+            self.pool[self.cur_pos] = last
+            self.pool = self.pool[:-1]
         
         # Check termination: M items selected or pool exhausted
         terminated = (len(self.selected) >= self.M) or (self.pool.size == 0)
+        truncated = False
+        if self.max_steps is not None and self.step_count >= self.max_steps and not terminated:
+            truncated = True
         
-        if terminated:
+        if terminated or truncated:
             # Return zero observation on termination
             obs = np.zeros(self.d, dtype=np.float32)
             info = {
-                "selected_idx": np.array(self.selected, dtype=np.int32),
                 "cum_reward": self.cum_reward,
                 "num_selected": len(self.selected),
+                "episode_len": self.step_count,
+                "truncated": truncated,
             }
             if self.d_metric == "cos":
                 info["d_metric"] = self.div_tracker.mean_cosine_distance
             else:
                 info["d_metric"] = self.div_tracker.trace_cov_unbiased
-            return obs, float(reward), True, False, info
+            return obs, float(reward), terminated, truncated, info
         
         # Sample next candidate
         obs = self._sample_next()

@@ -1,6 +1,5 @@
 import numpy as np
 import torch
-from envs.diversity_selection_env import OnlineCovTrace
 
 def mean_cosine_distance_for_indices(X_unit, idx):
     """
@@ -17,14 +16,17 @@ def mean_cosine_distance_for_indices(X_unit, idx):
     return 1.0 - mean_sim               # mean cosine distance
 
 
-def trace_diversity_for_indices(X_embed, idx):
+def trace_diversity_for_indices(X_unit, idx):
     """
-    Compute trace of unbiased covariance for selected indices (matches env reward).
+    X_unit: (N, d) L2-normalized.
+    idx: 1D array/list of selected indices.
     """
-    tracker = OnlineCovTrace(d=X_embed.shape[1])
-    for i in idx:
-        tracker.add(X_embed[i])
-    return tracker.trace_cov_unbiased
+    sel = X_unit[idx]
+    t = sel.shape[0]
+    if t <= 1:
+        return 0.0
+    cov = np.cov(sel, rowvar=False, bias=False)
+    return float(np.trace(cov))
 
 
 def inclusion_logprob(model, X, batch_size=8192, device=None):

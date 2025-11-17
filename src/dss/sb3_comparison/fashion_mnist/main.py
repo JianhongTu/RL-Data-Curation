@@ -9,13 +9,14 @@ from ..eval import evaluate, evaluate_ppov1
 from ..plot import plot_results
 from policies.ppov1 import PPOv1, PPOv1Config
 from compare_ppo_versions import SingleEnvWrapper
+import argparse
 import torch
 
-def main():
+def main(debug: bool = False):
     X_embed, y = build_fashion_mnist_embeddings()
     norms = np.linalg.norm(X_embed, axis=1, keepdims=True) + 1e-8
     X_unit = (X_embed / norms).astype(np.float32)
-    TOTAL_TIMESTEPS = 100000
+    TOTAL_TIMESTEPS = 100000 if not debug else 10000
 
     here = Path(__file__).resolve().parent
     models_dir = here / "model"
@@ -31,20 +32,26 @@ def main():
     M_train = int(0.2 * N)
     env_max = DiversitySelectionEnv(X_embed=X_unit, d_metric="trace", M=M_train, seed=42)
     env_min = DiversitySelectionEnv(X_embed=X_unit, M=M_train, d_metric="trace", seed=42, maximize=False)
-    env_max_v1 = SingleEnvWrapper(DiversitySelectionEnv(
-        X_embed=X_unit,
-        d_metric="trace",  # Paper uses trace for training (same as SB3)
-        M=M_train,
-        seed=42,          # or 43, doesn't matter much
-    ))
 
-    env_min_v1 = SingleEnvWrapper(DiversitySelectionEnv(
-        X_embed=X_unit,
-        d_metric="trace",  # Paper uses trace for training (same as SB3)
-        M=M_train,
-        seed=42,
-        maximize=False,
-    ))
+    # Paper baseline: single environment per agent
+    env_max_v1 = SingleEnvWrapper(
+        DiversitySelectionEnv(
+            X_embed=X_unit,
+            d_metric="trace",
+            M=M_train,
+            seed=42,
+            maximize=True,
+        )
+    )
+    env_min_v1 = SingleEnvWrapper(
+        DiversitySelectionEnv(
+            X_embed=X_unit,
+            d_metric="trace",
+            M=M_train,
+            seed=42,
+            maximize=False,
+        )
+    )
 
     if max_path.exists() and min_path.exists():
         print("Found existing models, loading from disk...")
@@ -52,15 +59,17 @@ def main():
         model_min = PPO.load(min_path, env=env_min)
     else:
         print("No saved models found, training from scratch...")
-        # W&B run (only when training)
-        run = wandb.init(
-            project="DRL Models",
-            config={
-                "dataset": "fashion_mnist",
-                "algo": "SB3-PPO",
-                "total_timesteps": TOTAL_TIMESTEPS,
-            },
-        )
+        run = None
+        if not debug:
+            # W&B run (skip in fast debug mode)
+            run = wandb.init(
+                project="DRL Models",
+                config={
+                    "dataset": "fashion_mnist",
+                    "algo": "SB3-PPO",
+                    "total_timesteps": TOTAL_TIMESTEPS,
+                },
+            )
 
         model_max = PPO(
             policy="MlpPolicy",
@@ -89,18 +98,37 @@ def main():
             verbose=2,
         )
 
-        model_max.learn(total_timesteps=TOTAL_TIMESTEPS, progress_bar=True, callback=wandb_cb)
-        model_min.learn(total_timesteps=TOTAL_TIMESTEPS, progress_bar=True, callback=wandb_cb)
+        model_max.learn(total_timesteps=TOTAL_TIMESTEPS, progress_bar=True, callback=wandb_cb if run else None)
+        model_min.learn(total_timesteps=TOTAL_TIMESTEPS, progress_bar=True, callback=wandb_cb if run else None)
 
         model_max.save(max_path)
         model_min.save(min_path)
 
-        run.finish()
+        if run is not None:
+            run.finish()
+
+    cartpole_like_config = PPOv1Config(
+        learning_rate=3e-4,
+        num_steps=512,
+        anneal_lr=True,
+        gae=False,
+        gamma=0.99,
+        gae_lambda=0.0,
+        update_epochs=4,
+        minibatch_size=64,
+        clip_coef=0.2,
+        norm_adv=True,
+        clip_vloss=True,
+        ent_coef=0.01,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        target_kl=0.03,
+    )
 
     if custom_max_path.exists() and custom_min_path.exists():
         print("Found existing PPOv1 models, loading from disk...")
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        config_v1 = PPOv1Config(gamma=1.0, gae=False, gae_lambda=0.0)
+        config_v1 = cartpole_like_config
         ppov1_max = PPOv1(envs=env_max_v1, config=config_v1, device=device)
         ppov1_min = PPOv1(envs=env_min_v1, config=config_v1, device=device)
         ppov1_max.load(custom_max_path)
@@ -108,7 +136,7 @@ def main():
     else:
         print("No saved models found, training from scratch...")
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        config_v1 = PPOv1Config()  # uses the paper-aligned defaults
+        config_v1 = cartpole_like_config  # reuse CartPole-proven config
 
         # Create PPOv1 agents
         ppov1_max = PPOv1(envs=env_max_v1, config=config_v1, device=device)
@@ -127,14 +155,26 @@ def main():
 
         # How many PPO updates to reach TOTAL_TIMESTEPS?
         steps_per_update = config_v1.num_steps * env_max_v1.num_envs
-        num_updates = TOTAL_TIMESTEPS // steps_per_update
+        num_updates = max(1, TOTAL_TIMESTEPS // steps_per_update)
 
         global_step_max = 0
         global_step_min = 0
 
-        # Track latest episode stats for diagnostics
         last_max_episode = None
         last_min_episode = None
+
+        def extract_final_episode(info_bucket):
+            if not info_bucket:
+                return None
+            if isinstance(info_bucket, dict):
+                return info_bucket
+            if isinstance(info_bucket, (list, tuple)):
+                for entry in reversed(info_bucket):
+                    if isinstance(entry, dict) and entry:
+                        return entry
+            return None
+
+        log_interval = 1 if debug else 10
 
         for update in range(1, num_updates + 1):
             # Optional: anneal LR
@@ -165,42 +205,51 @@ def main():
             )
             metrics_min = ppov1_min.update(adv_min, ret_min)
 
-            # Capture episode stats for diagnostics
-            if info_max_rollout and "final_info" in info_max_rollout:
-                final = info_max_rollout["final_info"][0]
+            final = extract_final_episode(info_max_rollout)
+            if final:
                 last_max_episode = {
                     "reward": float(final.get("cum_reward", 0.0)),
                     "diversity": float(final.get("d_metric", 0.0)),
                     "selected": int(final.get("num_selected", 0)),
+                    "length": int(final.get("episode_len", 0)),
+                    "truncated": bool(final.get("truncated", False)),
                 }
-            if info_min_rollout and "final_info" in info_min_rollout:
-                final = info_min_rollout["final_info"][0]
+            final = extract_final_episode(info_min_rollout)
+            if final:
                 last_min_episode = {
                     "reward": float(final.get("cum_reward", 0.0)),
                     "diversity": float(final.get("d_metric", 0.0)),
                     "selected": int(final.get("num_selected", 0)),
+                    "length": int(final.get("episode_len", 0)),
+                    "truncated": bool(final.get("truncated", False)),
                 }
 
             # (Optional) print basic progress
-            if update % 10 == 0 or update == 1:
+            if update % log_interval == 0 or update == 1 or update == num_updates:
                 max_stats_str = (
                     f"R={last_max_episode['reward']:.3f}, "
                     f"D={last_max_episode['diversity']:.3f}, "
-                    f"N={last_max_episode['selected']}"
+                    f"N={last_max_episode['selected']}, "
+                    f"T={last_max_episode['truncated']}, "
+                    f"L={last_max_episode['length']}"
                     if last_max_episode
                     else "R=NA, D=NA"
                 )
                 min_stats_str = (
                     f"R={last_min_episode['reward']:.3f}, "
                     f"D={last_min_episode['diversity']:.3f}, "
-                    f"N={last_min_episode['selected']}"
+                    f"N={last_min_episode['selected']}, "
+                    f"T={last_min_episode['truncated']}, "
+                    f"L={last_min_episode['length']}"
                     if last_min_episode
                     else "R=NA, D=NA"
                 )
                 print(
                     f"Update {update}/{num_updates} | "
-                    f"Max EV={metrics_max['explained_variance']:.3f} ({max_stats_str}) | "
-                    f"Min EV={metrics_min['explained_variance']:.3f} ({min_stats_str})"
+                    f"Max EV={metrics_max['explained_variance']:.3f} "
+                    f"(Inc={metrics_max['action_mean']:.2f}; {max_stats_str}) | "
+                    f"Min EV={metrics_min['explained_variance']:.3f} "
+                    f"(Inc={metrics_min['action_mean']:.2f}; {min_stats_str})"
                 )
 
         # Save PPOv1 models
@@ -208,6 +257,8 @@ def main():
         ppov1_min.save(custom_min_path)
 
     size_percents = [2, 5, 10, 15, 20, 25, 30, 40, 50]
+    if debug:
+        size_percents = [2, 10, 30]
 
     with torch.no_grad():
         X_sample = torch.tensor(X_unit[:10], dtype=torch.float32, device=device)
@@ -217,9 +268,14 @@ def main():
 
     results_max, results_min, results_rand = evaluate(size_percents, N, X_unit, model_max, model_min)
     results_max_ppov1, results_min_ppov1 = evaluate_ppov1(size_percents, N, X_unit, ppov1_max, ppov1_min)
-    print("PPOv1 Max diversity by size:", dict(zip(size_percents, results_max_ppov1)))
-    print("PPOv1 Min diversity by size:", dict(zip(size_percents, results_min_ppov1)))
     plot_results(size_percents, results_max, results_min, results_rand, "fashion_mnist_plot.png", results_max_ppov1, results_min_ppov1)
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Fashion-MNIST PPO comparison")
+    parser.add_argument(
+        "--fast-debug",
+        action="store_true",
+        help="Use smaller settings for quick iteration (shorter training, fewer eval points, no W&B)",
+    )
+    args = parser.parse_args()
+    main(debug=args.fast_debug)

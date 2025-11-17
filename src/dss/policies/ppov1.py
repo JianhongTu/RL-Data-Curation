@@ -1,11 +1,8 @@
 """
 PPO v1: Paper-Aligned Implementation
 =====================================
-This implementation matches the specifications from the DRL Final Project paper:
-- gamma = 1.0 (no temporal discounting)
-- gae_lambda = 0.0 (no GAE, use actual rewards)
-- Network architecture: [64, 64] (matching SB3 MlpPolicy default)
-- Designed specifically for data subset selection task
+This implementation matches the specifications from the DRL Final Project paper while
+borrowing the SB3-default MLP ([64, 64]) to keep parity with reference runs.
 """
 
 from dataclasses import dataclass
@@ -36,7 +33,7 @@ class PPOv1Config:
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     target_kl: Optional[float] = None
-    vf_clip_coef: float = 0.2  # Use same as policy clipping (SB3 uses clip_coef for both)
+    vf_clip_coef: float = 0.2  # Match policy clip coefficient
     
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
@@ -138,7 +135,7 @@ class PPOv1:
         Returns:
             Updated next_obs, next_terminated, next_truncated, episode_info, new_global_step
         """
-        episode_info = {}
+        episode_infos = []
         
         for step in range(self.config.num_steps):
             global_step += self.num_envs
@@ -161,10 +158,51 @@ class PPOv1:
             next_truncated = torch.Tensor(truncated).to(self.device)
             
             # Log episode info if available
-            if "final_info" in info:
-                episode_info = info
+            finals = None
+            if isinstance(info, dict):
+                finals = info.get("final_info")
+                if finals is None:
+                    # Gymnasium vector env aggregates terminated info into arrays with _mask fields.
+                    mask_keys = [k for k in info.keys() if k.startswith("_")]
+                    if mask_keys:
+                        num_envs = self.num_envs
+                        env_infos = [dict() for _ in range(num_envs)]
+                        mask_present = False
+                        for key, value in info.items():
+                            if key.startswith("_"):
+                                continue
+                            mask = info.get(f"_{key}")
+                            if mask is None:
+                                continue
+                            mask_present = True
+                            for env_idx in range(num_envs):
+                                if not mask[env_idx]:
+                                    continue
+                                v = value[env_idx]
+                                if isinstance(v, np.ndarray):
+                                    env_infos[env_idx][key] = v.tolist()
+                                else:
+                                    env_infos[env_idx][key] = v.item() if isinstance(v, np.generic) else v
+                        if mask_present:
+                            finals = [ei for ei in env_infos if ei]
+            elif isinstance(info, (list, tuple)):
+                finals = []
+                for entry in info:
+                    if isinstance(entry, dict) and "final_info" in entry:
+                        finals.append(entry["final_info"])
+            if finals is not None and finals:
+                if isinstance(finals, (list, tuple)):
+                    for fin in finals:
+                        if isinstance(fin, (list, tuple)):
+                            for inner in fin:
+                                if inner:
+                                    episode_infos.append(inner)
+                        elif fin:
+                            episode_infos.append(fin)
+                else:
+                    episode_infos.append(finals)
         
-        return next_obs, next_terminated, next_truncated, episode_info, global_step
+        return next_obs, next_terminated, next_truncated, episode_infos, global_step
     
     def compute_advantages_and_returns(self, next_obs, next_terminated, next_truncated):
         """
@@ -232,13 +270,12 @@ class PPOv1:
         # Optimization
         b_inds = np.arange(self.batch_size)
         clipfracs = []
-        
-        # Initialize variables for tracking metrics across all minibatches
         epoch_old_approx_kl = None
         epoch_approx_kl = None
         
         for epoch in range(self.config.update_epochs):
             np.random.shuffle(b_inds)
+            mb_count = 0
             for start in range(0, self.batch_size, self.config.minibatch_size):
                 end = start + self.config.minibatch_size
                 mb_inds = b_inds[start:end]
@@ -253,14 +290,13 @@ class PPOv1:
                     # Calculate approx KL divergence (average across minibatches)
                     mb_old_approx_kl = (-logratio).mean()
                     mb_approx_kl = ((ratio - 1) - logratio).mean()
+                    mb_count += 1
                     if epoch_old_approx_kl is None:
                         epoch_old_approx_kl = mb_old_approx_kl
                         epoch_approx_kl = mb_approx_kl
                     else:
-                        # Average KL across minibatches (simple average)
-                        n_mb = (start // self.config.minibatch_size) + 1
-                        epoch_old_approx_kl = (epoch_old_approx_kl * (n_mb - 1) + mb_old_approx_kl) / n_mb
-                        epoch_approx_kl = (epoch_approx_kl * (n_mb - 1) + mb_approx_kl) / n_mb
+                        epoch_old_approx_kl = (epoch_old_approx_kl * (mb_count - 1) + mb_old_approx_kl) / mb_count
+                        epoch_approx_kl = (epoch_approx_kl * (mb_count - 1) + mb_approx_kl) / mb_count
                     clipfracs += [((ratio - 1.0).abs() > self.config.clip_coef).float().mean().item()]
                 
                 mb_advantages = b_advantages[mb_inds]
@@ -298,11 +334,10 @@ class PPOv1:
                 nn.utils.clip_grad_norm_(self.agent.parameters(), self.config.max_grad_norm)
                 self.optimizer.step()
             
-            # Early stopping based on KL divergence (use averaged KL from this epoch)
+            # Early stopping based on KL divergence (use averaged KL)
             if self.config.target_kl is not None:
                 if epoch_approx_kl is not None and epoch_approx_kl > self.config.target_kl:
                     break
-            # Reset for next epoch
             epoch_old_approx_kl = None
             epoch_approx_kl = None
         
@@ -310,8 +345,8 @@ class PPOv1:
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
-        
-        # Compute final KL from all data (after all epochs)
+
+        # Compute final KL over full batch for logging
         with torch.no_grad():
             _, final_logprob, _, _ = self.agent.get_action_and_value(
                 b_obs, b_actions.long()
@@ -321,7 +356,8 @@ class PPOv1:
             final_old_approx_kl = (-final_logratio).mean()
             final_approx_kl = ((final_ratio - 1) - final_logratio).mean()
         
-        # Get final values from last minibatch for return (metrics from last update)
+        action_mean = float(self.actions.mean().item())
+
         return {
             "value_loss": v_loss.item(),
             "policy_loss": pg_loss.item(),
@@ -330,6 +366,7 @@ class PPOv1:
             "approx_kl": final_approx_kl.item(),
             "clipfrac": np.mean(clipfracs),
             "explained_variance": explained_var,
+            "action_mean": action_mean,
         }
     
     def anneal_learning_rate(self, update, num_updates):
@@ -366,10 +403,10 @@ class PPOv1:
             scores = log_probs[:, 1].cpu().numpy()  # log P(include|x)
         
         # Rank and select
-        # NOTE: Regardless of maximize/minimize, the agent learns to assign HIGH log-prob
-        # to items it wants to include (maximize → diverse, minimize → similar due to negated rewards).
-        # So inference should always pick highest log-prob entries; the minimize flag only chooses
-        # which trained agent to use.
+        # Regardless of maximize/minimize, the agent learns to assign HIGH log-prob
+        # to items it should include (min agent sees negated rewards). So inference
+        # just picks the highest log-prob entries; choose which trained agent to use via
+        # the minimize flag outside this function.
         selected_indices = np.argsort(scores)[::-1][:k]
         
         self.agent.train()
