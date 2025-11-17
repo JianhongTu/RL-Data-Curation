@@ -48,7 +48,7 @@ def evaluate(size_percents, N, X_unit, model_max, model_min):
 
 import numpy as np
 
-def evaluate_ppov1(size_percents, N, X_unit, ppo_v1_max, ppo_v1_min):
+def evaluate_ppov1(size_percents, N, X_unit, ppo_v1_max, ppo_v1_min=None):
     results_ppov1_max = []
     results_ppov1_min = []
 
@@ -56,19 +56,21 @@ def evaluate_ppov1(size_percents, N, X_unit, ppo_v1_max, ppo_v1_min):
         M = int(pct / 100 * N)
         print(f"=== PPOv1 Size {pct}% (M={M}) ===")
 
-        # Most diverse subset
-        idx_max, _ = ppo_v1_max.score_and_rank_inference(
+        idx_max, scores = ppo_v1_max.score_and_rank_inference(
             X_embed=X_unit,
             k=M,
             minimize=False,
         )
 
-        # Least diverse subset
-        idx_min, _ = ppo_v1_min.score_and_rank_inference(
-            X_embed=X_unit,
-            k=M,
-            minimize=True,
-        )
+        if ppo_v1_min is None:
+            order = np.argsort(scores)
+            idx_min = order[:M]
+        else:
+            idx_min, _ = ppo_v1_min.score_and_rank_inference(
+                X_embed=X_unit,
+                k=M,
+                minimize=False,
+            )
 
         m_ppov1_max = mean_cosine_distance_for_indices(X_unit, idx_max)
         m_ppov1_min = mean_cosine_distance_for_indices(X_unit, idx_min)
@@ -78,7 +80,7 @@ def evaluate_ppov1(size_percents, N, X_unit, ppo_v1_max, ppo_v1_min):
 
         print(
             f"    PPOv1 Max: cos={m_ppov1_max:.4f}, trace={trace_ppov1_max:.4f} | "
-            f"PPOv1 Min: cos={m_ppov1_min:.4f}, trace={trace_ppov1_min:.4f}"
+            f"PPOv1 Min (flipped): cos={m_ppov1_min:.4f}, trace={trace_ppov1_min:.4f}"
         )
 
         results_ppov1_max.append(m_ppov1_max)

@@ -1,19 +1,22 @@
 import numpy as np
 import torch
 
-def mean_cosine_distance_for_indices(X_unit, idx):
+def mean_cosine_distance_for_indices(X, idx):
     """
-    X_unit: (N, d) L2-normalized.
+    X: (N, d) raw feature vectors.
     idx: 1D array/list of selected indices.
     """
-    sel = X_unit[idx]
+    sel = X[idx]
     t = sel.shape[0]
     if t <= 1:
         return 0.0
-    s = sel.sum(axis=0)                 # sum of vectors
-    s2 = float(np.dot(s, s))            # ||sum||^2
-    mean_sim = (s2 - t) / (t * (t - 1)) # mean cosine similarity
-    return 1.0 - mean_sim               # mean cosine distance
+    # Normalize rows to unit length
+    norms = np.linalg.norm(sel, axis=1, keepdims=True) + 1e-8
+    sel_unit = sel / norms
+    s = sel_unit.sum(axis=0)                 # sum of unit vectors
+    s2 = float(np.dot(s, s))                 # ||sum||^2
+    mean_sim = (s2 - t) / (t * (t - 1))      # mean cosine similarity
+    return 1.0 - mean_sim                    # mean cosine distance
 
 
 def trace_diversity_for_indices(X_unit, idx):

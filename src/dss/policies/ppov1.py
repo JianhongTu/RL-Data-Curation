@@ -34,6 +34,8 @@ class PPOv1Config:
     max_grad_norm: float = 0.5
     target_kl: Optional[float] = None
     vf_clip_coef: float = 0.2  # Match policy clip coefficient
+    reward_norm: bool = False
+    use_value_function: bool = True
     
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
@@ -209,31 +211,16 @@ class PPOv1:
         Compute advantages and returns.
         Paper uses γ=1.0 and λ=0.0, which means simple Monte Carlo returns.
         """
+        rewards = self.rewards.clone()
+        if self.config.reward_norm:
+            mean = rewards.mean()
+            std = rewards.std()
+            rewards = (rewards - mean) / (std + 1e-8)
+
         with torch.no_grad():
-            next_value = self.agent.get_value(next_obs).reshape(1, -1)
-            
-            #if self.config.gae and self.config.gae_lambda > 0:
-            if False:
-                # Standard GAE (for comparison)
-                advantages = torch.zeros_like(self.rewards).to(self.device)
-                lastgaelam = 0
-                for t in reversed(range(self.config.num_steps)):
-                    if t == self.config.num_steps - 1:
-                        nextnonterminal = 1.0 - torch.logical_or(
-                            next_terminated, next_truncated
-                        ).float()
-                        nextvalues = next_value
-                    else:
-                        nextnonterminal = 1.0 - torch.logical_or(
-                            self.terminateds[t + 1], self.truncateds[t + 1]
-                        ).float()
-                        nextvalues = self.values[t + 1]
-                    delta = self.rewards[t] + self.config.gamma * nextvalues * nextnonterminal - self.values[t]
-                    advantages[t] = lastgaelam = delta + self.config.gamma * self.config.gae_lambda * nextnonterminal * lastgaelam
-                returns = advantages + self.values
-            else:
-                # Paper's method: γ=1.0, λ=0.0 → Simple Monte Carlo returns
-                returns = torch.zeros_like(self.rewards).to(self.device)
+            if self.config.use_value_function:
+                next_value = self.agent.get_value(next_obs).reshape(1, -1)
+                returns = torch.zeros_like(rewards).to(self.device)
                 for t in reversed(range(self.config.num_steps)):
                     if t == self.config.num_steps - 1:
                         nextnonterminal = 1.0 - torch.logical_or(
@@ -245,9 +232,11 @@ class PPOv1:
                             self.terminateds[t + 1], self.truncateds[t + 1]
                         ).float()
                         next_return = returns[t + 1]
-                    # With γ=1.0: returns[t] = rewards[t] + γ * nextnonterminal * next_return
-                    returns[t] = self.rewards[t] + self.config.gamma * nextnonterminal * next_return
+                    returns[t] = rewards[t] + self.config.gamma * nextnonterminal * next_return
                 advantages = returns - self.values
+            else:
+                advantages = rewards
+                returns = rewards.clone()
         
         return advantages, returns
     
@@ -265,7 +254,10 @@ class PPOv1:
         # Don't normalize advantages here - normalize per minibatch if norm_adv is True
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
-        b_values = self.values.reshape(-1)
+        if self.config.use_value_function:
+            b_values = self.values.reshape(-1)
+        else:
+            b_values = torch.zeros_like(b_returns)
         
         # Optimization
         b_inds = np.arange(self.batch_size)
@@ -312,18 +304,21 @@ class PPOv1:
                 
                 # Value loss
                 newvalue = newvalue.view(-1)
-                if self.config.clip_vloss:
-                    v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
-                    v_clipped = b_values[mb_inds] + torch.clamp(
-                        newvalue - b_values[mb_inds],
-                        -self.config.vf_clip_coef,
-                        self.config.vf_clip_coef,
-                    )
-                    v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
-                    v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
-                    v_loss = 0.5 * v_loss_max.mean()
+                if self.config.use_value_function and self.config.vf_coef > 0:
+                    if self.config.clip_vloss:
+                        v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
+                        v_clipped = b_values[mb_inds] + torch.clamp(
+                            newvalue - b_values[mb_inds],
+                            -self.config.vf_clip_coef,
+                            self.config.vf_clip_coef,
+                        )
+                        v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
+                        v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
+                        v_loss = 0.5 * v_loss_max.mean()
+                    else:
+                        v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
                 else:
-                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
+                    v_loss = torch.tensor(0.0, device=self.device)
                 
                 entropy_loss = entropy.mean()
                 loss = pg_loss - self.config.ent_coef * entropy_loss + v_loss * self.config.vf_coef
@@ -402,12 +397,12 @@ class PPOv1:
             log_probs = torch.log_softmax(logits, dim=-1)
             scores = log_probs[:, 1].cpu().numpy()  # log P(include|x)
         
-        # Rank and select
-        # Regardless of maximize/minimize, the agent learns to assign HIGH log-prob
-        # to items it should include (min agent sees negated rewards). So inference
-        # just picks the highest log-prob entries; choose which trained agent to use via
-        # the minimize flag outside this function.
-        selected_indices = np.argsort(scores)[::-1][:k]
+        # Rank and select. Regardless of training objective, higher log-prob => agent wants to include.
+        # If you wish to obtain the least-diverse subset from a single (maximize-trained) agent,
+        # call this once and flip the order externally (per paper Section 4). When training a
+        # dedicated minimize agent with negated rewards, keep descending order.
+        order = np.argsort(scores)[::-1]
+        selected_indices = order[:k]
         
         self.agent.train()
         return selected_indices, scores
