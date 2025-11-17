@@ -4,7 +4,7 @@ PPO v1: Paper-Aligned Implementation
 This implementation matches the specifications from the DRL Final Project paper:
 - gamma = 1.0 (no temporal discounting)
 - gae_lambda = 0.0 (no GAE, use actual rewards)
-- Network architecture: [256, 256] (larger than standard)
+- Network architecture: [64, 64] (matching SB3 MlpPolicy default)
 - Designed specifically for data subset selection task
 """
 
@@ -24,18 +24,19 @@ class PPOv1Config:
     learning_rate: float = 3e-4
     num_steps: int = 2048              # Paper: 2048
     anneal_lr: bool = True
-    gae: bool = True                   # Paper: λ=0 means no GAE
-    gamma: float = 0.99                  # Paper: 1.0 (no discounting)
-    gae_lambda: float = 0.95             # Paper: 0.0 (no GAE)
+    gae: bool = False                   # Paper: λ=0 means no GAE
+    gamma: float = 1.0                  # Paper: 1.0 (no discounting)
+    gae_lambda: float = 0.00             # Paper: 0.0 (no GAE)
     update_epochs: int = 10             # Paper: 10
     minibatch_size: int = 64            # Paper: 64
     clip_coef: float = 0.2
     norm_adv: bool = True
     clip_vloss: bool = True
-    ent_coef: float = 0.01
+    ent_coef: float = 0.01  # Small entropy bonus for exploration (SB3 default)
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     target_kl: Optional[float] = None
+    vf_clip_coef: float = 0.2  # Use same as policy clipping (SB3 uses clip_coef for both)
     
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
@@ -46,29 +47,29 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 
 class AgentV1(nn.Module):
-    """PPO Agent with paper-specified architecture: [256, 256]"""
+    """PPO Agent - Using [64, 64] to match SB3 MlpPolicy default architecture"""
     
     def __init__(self, envs):
         super().__init__()
         obs_shape = np.array(envs.single_observation_space.shape).prod()
         n_actions = envs.single_action_space.n
         
-        # Critic network (value function) - Paper: [256, 256]
+        # Critic network (value function) - Match SB3 default [64, 64]
         self.critic = nn.Sequential(
-            layer_init(nn.Linear(obs_shape, 256)),
+            layer_init(nn.Linear(obs_shape, 64)),
             nn.Tanh(),
-            layer_init(nn.Linear(256, 256)),
+            layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
-            layer_init(nn.Linear(256, 1), std=1.0),
+            layer_init(nn.Linear(64, 1), std=1.0),
         )
         
-        # Actor network (policy) - Paper: [256, 256]
+        # Actor network (policy) - Match SB3 default [64, 64]
         self.actor = nn.Sequential(
-            layer_init(nn.Linear(obs_shape, 256)),
+            layer_init(nn.Linear(obs_shape, 64)),
             nn.Tanh(),
-            layer_init(nn.Linear(256, 256)),
+            layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
-            layer_init(nn.Linear(256, n_actions), std=0.01),
+            layer_init(nn.Linear(64, n_actions), std=0.01),
         )
     
     def get_value(self, x):
@@ -173,7 +174,8 @@ class PPOv1:
         with torch.no_grad():
             next_value = self.agent.get_value(next_obs).reshape(1, -1)
             
-            if self.config.gae and self.config.gae_lambda > 0:
+            #if self.config.gae and self.config.gae_lambda > 0:
+            if False:
                 # Standard GAE (for comparison)
                 advantages = torch.zeros_like(self.rewards).to(self.device)
                 lastgaelam = 0
@@ -205,7 +207,7 @@ class PPOv1:
                             self.terminateds[t + 1], self.truncateds[t + 1]
                         ).float()
                         next_return = returns[t + 1]
-                    # With γ=1.0, this becomes: returns[t] = rewards[t] + nextnonterminal * next_return
+                    # With γ=1.0: returns[t] = rewards[t] + γ * nextnonterminal * next_return
                     returns[t] = self.rewards[t] + self.config.gamma * nextnonterminal * next_return
                 advantages = returns - self.values
         
@@ -222,6 +224,7 @@ class PPOv1:
         b_obs = self.obs.reshape((-1,) + self.envs.single_observation_space.shape)
         b_logprobs = self.logprobs.reshape(-1)
         b_actions = self.actions.reshape((-1,) + self.envs.single_action_space.shape)
+        # Don't normalize advantages here - normalize per minibatch if norm_adv is True
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = self.values.reshape(-1)
@@ -229,6 +232,10 @@ class PPOv1:
         # Optimization
         b_inds = np.arange(self.batch_size)
         clipfracs = []
+        
+        # Initialize variables for tracking metrics across all minibatches
+        epoch_old_approx_kl = None
+        epoch_approx_kl = None
         
         for epoch in range(self.config.update_epochs):
             np.random.shuffle(b_inds)
@@ -243,9 +250,17 @@ class PPOv1:
                 ratio = logratio.exp()
                 
                 with torch.no_grad():
-                    # Calculate approx KL divergence
-                    old_approx_kl = (-logratio).mean()
-                    approx_kl = ((ratio - 1) - logratio).mean()
+                    # Calculate approx KL divergence (average across minibatches)
+                    mb_old_approx_kl = (-logratio).mean()
+                    mb_approx_kl = ((ratio - 1) - logratio).mean()
+                    if epoch_old_approx_kl is None:
+                        epoch_old_approx_kl = mb_old_approx_kl
+                        epoch_approx_kl = mb_approx_kl
+                    else:
+                        # Average KL across minibatches (simple average)
+                        n_mb = (start // self.config.minibatch_size) + 1
+                        epoch_old_approx_kl = (epoch_old_approx_kl * (n_mb - 1) + mb_old_approx_kl) / n_mb
+                        epoch_approx_kl = (epoch_approx_kl * (n_mb - 1) + mb_approx_kl) / n_mb
                     clipfracs += [((ratio - 1.0).abs() > self.config.clip_coef).float().mean().item()]
                 
                 mb_advantages = b_advantages[mb_inds]
@@ -265,8 +280,8 @@ class PPOv1:
                     v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
                     v_clipped = b_values[mb_inds] + torch.clamp(
                         newvalue - b_values[mb_inds],
-                        -self.config.clip_coef,
-                        self.config.clip_coef,
+                        -self.config.vf_clip_coef,
+                        self.config.vf_clip_coef,
                     )
                     v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
                     v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
@@ -283,22 +298,36 @@ class PPOv1:
                 nn.utils.clip_grad_norm_(self.agent.parameters(), self.config.max_grad_norm)
                 self.optimizer.step()
             
-            # Early stopping based on KL divergence
+            # Early stopping based on KL divergence (use averaged KL from this epoch)
             if self.config.target_kl is not None:
-                if approx_kl > self.config.target_kl:
+                if epoch_approx_kl is not None and epoch_approx_kl > self.config.target_kl:
                     break
+            # Reset for next epoch
+            epoch_old_approx_kl = None
+            epoch_approx_kl = None
         
         # Calculate explained variance
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
         
+        # Compute final KL from all data (after all epochs)
+        with torch.no_grad():
+            _, final_logprob, _, _ = self.agent.get_action_and_value(
+                b_obs, b_actions.long()
+            )
+            final_logratio = final_logprob - b_logprobs
+            final_ratio = final_logratio.exp()
+            final_old_approx_kl = (-final_logratio).mean()
+            final_approx_kl = ((final_ratio - 1) - final_logratio).mean()
+        
+        # Get final values from last minibatch for return (metrics from last update)
         return {
             "value_loss": v_loss.item(),
             "policy_loss": pg_loss.item(),
             "entropy": entropy_loss.item(),
-            "old_approx_kl": old_approx_kl.item(),
-            "approx_kl": approx_kl.item(),
+            "old_approx_kl": final_old_approx_kl.item(),
+            "approx_kl": final_approx_kl.item(),
             "clipfrac": np.mean(clipfracs),
             "explained_variance": explained_var,
         }
@@ -337,10 +366,11 @@ class PPOv1:
             scores = log_probs[:, 1].cpu().numpy()  # log P(include|x)
         
         # Rank and select
-        if minimize:
-            selected_indices = np.argsort(scores)[:k]
-        else:
-            selected_indices = np.argsort(scores)[::-1][:k]
+        # NOTE: Regardless of maximize/minimize, the agent learns to assign HIGH log-prob
+        # to items it wants to include (maximize → diverse, minimize → similar due to negated rewards).
+        # So inference should always pick highest log-prob entries; the minimize flag only chooses
+        # which trained agent to use.
+        selected_indices = np.argsort(scores)[::-1][:k]
         
         self.agent.train()
         return selected_indices, scores

@@ -3,7 +3,7 @@ from pathlib import Path
 import wandb
 from wandb.integration.sb3 import WandbCallback
 from envs.diversity_selection_env import DiversitySelectionEnv
-from .embeddings import build_fashion_mnist_embeddings
+from .embeddings import build_alpaca_embeddings
 from stable_baselines3 import PPO
 from ..eval import evaluate, evaluate_ppov1
 from ..plot import plot_results
@@ -12,7 +12,7 @@ from compare_ppo_versions import SingleEnvWrapper
 import torch
 
 def main():
-    X_embed, y = build_fashion_mnist_embeddings()
+    X_embed, y = build_alpaca_embeddings()
     norms = np.linalg.norm(X_embed, axis=1, keepdims=True) + 1e-8
     X_unit = (X_embed / norms).astype(np.float32)
     TOTAL_TIMESTEPS = 100000
@@ -29,18 +29,19 @@ def main():
 
     N = len(X_embed)
     M_train = int(0.2 * N)
-    env_max = DiversitySelectionEnv(X_embed=X_unit, d_metric="trace", M=M_train, seed=42)
-    env_min = DiversitySelectionEnv(X_embed=X_unit, M=M_train, d_metric="trace", seed=42, maximize=False)
+    # Paper: Alpaca uses "Mean Cos Distance" for training (Table 2)
+    env_max = DiversitySelectionEnv(X_embed=X_unit, d_metric="cos", M=M_train, seed=42)
+    env_min = DiversitySelectionEnv(X_embed=X_unit, M=M_train, d_metric="cos", seed=42, maximize=False)
     env_max_v1 = SingleEnvWrapper(DiversitySelectionEnv(
         X_embed=X_unit,
-        d_metric="trace",
+        d_metric="cos",  # Paper: Alpaca uses "Mean Cos Distance" for training
         M=M_train,
-        seed=42,          # or 43, doesn't matter much
+        seed=42,
     ))
 
     env_min_v1 = SingleEnvWrapper(DiversitySelectionEnv(
         X_embed=X_unit,
-        d_metric="trace",
+        d_metric="cos",  # Paper: Alpaca uses "Mean Cos Distance" for training
         M=M_train,
         seed=42,
         maximize=False,
@@ -56,7 +57,7 @@ def main():
         run = wandb.init(
             project="DRL Models",
             config={
-                "dataset": "fashion_mnist",
+                "dataset": "alpaca",
                 "algo": "SB3-PPO",
                 "total_timesteps": TOTAL_TIMESTEPS,
             },
@@ -100,7 +101,7 @@ def main():
     if custom_max_path.exists() and custom_min_path.exists():
         print("Found existing PPOv1 models, loading from disk...")
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        config_v1 = PPOv1Config()
+        config_v1 = PPOv1Config(gamma=1.0, gae=False, gae_lambda=0.0)
         ppov1_max = PPOv1(envs=env_max_v1, config=config_v1, device=device)
         ppov1_min = PPOv1(envs=env_min_v1, config=config_v1, device=device)
         ppov1_max.load(custom_max_path)
@@ -183,7 +184,7 @@ def main():
 
     results_max, results_min, results_rand = evaluate(size_percents, N, X_unit, model_max, model_min)
     results_max_ppov1, results_min_ppov1 = evaluate_ppov1(size_percents, N, X_unit, ppov1_max, ppov1_min)
-    plot_results(size_percents, results_max, results_min, results_rand, "fashion_mnist_plot.png", results_max_ppov1, results_min_ppov1)
+    plot_results(size_percents, results_max, results_min, results_rand, "alpaca_plot.png", results_max_ppov1, results_min_ppov1)
 
 if __name__ == "__main__":
     main()

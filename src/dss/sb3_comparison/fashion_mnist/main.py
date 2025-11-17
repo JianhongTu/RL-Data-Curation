@@ -33,14 +33,14 @@ def main():
     env_min = DiversitySelectionEnv(X_embed=X_unit, M=M_train, d_metric="trace", seed=42, maximize=False)
     env_max_v1 = SingleEnvWrapper(DiversitySelectionEnv(
         X_embed=X_unit,
-        d_metric="trace",
+        d_metric="trace",  # Paper uses trace for training (same as SB3)
         M=M_train,
         seed=42,          # or 43, doesn't matter much
     ))
 
     env_min_v1 = SingleEnvWrapper(DiversitySelectionEnv(
         X_embed=X_unit,
-        d_metric="trace",
+        d_metric="trace",  # Paper uses trace for training (same as SB3)
         M=M_train,
         seed=42,
         maximize=False,
@@ -100,7 +100,7 @@ def main():
     if custom_max_path.exists() and custom_min_path.exists():
         print("Found existing PPOv1 models, loading from disk...")
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        config_v1 = PPOv1Config()
+        config_v1 = PPOv1Config(gamma=1.0, gae=False, gae_lambda=0.0)
         ppov1_max = PPOv1(envs=env_max_v1, config=config_v1, device=device)
         ppov1_min = PPOv1(envs=env_min_v1, config=config_v1, device=device)
         ppov1_max.load(custom_max_path)
@@ -132,13 +132,17 @@ def main():
         global_step_max = 0
         global_step_min = 0
 
+        # Track latest episode stats for diagnostics
+        last_max_episode = None
+        last_min_episode = None
+
         for update in range(1, num_updates + 1):
             # Optional: anneal LR
             ppov1_max.anneal_learning_rate(update, num_updates)
             ppov1_min.anneal_learning_rate(update, num_updates)
 
             # --- MAX agent rollout + update ---
-            next_obs_max, next_term_max, next_trunc_max, _, global_step_max = ppov1_max.rollout(
+            next_obs_max, next_term_max, next_trunc_max, info_max_rollout, global_step_max = ppov1_max.rollout(
                 next_obs_max,
                 next_term_max,
                 next_trunc_max,
@@ -150,7 +154,7 @@ def main():
             metrics_max = ppov1_max.update(adv_max, ret_max)
 
             # --- MIN agent rollout + update ---
-            next_obs_min, next_term_min, next_trunc_min, _, global_step_min = ppov1_min.rollout(
+            next_obs_min, next_term_min, next_trunc_min, info_min_rollout, global_step_min = ppov1_min.rollout(
                 next_obs_min,
                 next_term_min,
                 next_trunc_min,
@@ -161,12 +165,42 @@ def main():
             )
             metrics_min = ppov1_min.update(adv_min, ret_min)
 
+            # Capture episode stats for diagnostics
+            if info_max_rollout and "final_info" in info_max_rollout:
+                final = info_max_rollout["final_info"][0]
+                last_max_episode = {
+                    "reward": float(final.get("cum_reward", 0.0)),
+                    "diversity": float(final.get("d_metric", 0.0)),
+                    "selected": int(final.get("num_selected", 0)),
+                }
+            if info_min_rollout and "final_info" in info_min_rollout:
+                final = info_min_rollout["final_info"][0]
+                last_min_episode = {
+                    "reward": float(final.get("cum_reward", 0.0)),
+                    "diversity": float(final.get("d_metric", 0.0)),
+                    "selected": int(final.get("num_selected", 0)),
+                }
+
             # (Optional) print basic progress
             if update % 10 == 0 or update == 1:
+                max_stats_str = (
+                    f"R={last_max_episode['reward']:.3f}, "
+                    f"D={last_max_episode['diversity']:.3f}, "
+                    f"N={last_max_episode['selected']}"
+                    if last_max_episode
+                    else "R=NA, D=NA"
+                )
+                min_stats_str = (
+                    f"R={last_min_episode['reward']:.3f}, "
+                    f"D={last_min_episode['diversity']:.3f}, "
+                    f"N={last_min_episode['selected']}"
+                    if last_min_episode
+                    else "R=NA, D=NA"
+                )
                 print(
                     f"Update {update}/{num_updates} | "
-                    f"Max EV={metrics_max['explained_variance']:.3f} | "
-                    f"Min EV={metrics_min['explained_variance']:.3f}"
+                    f"Max EV={metrics_max['explained_variance']:.3f} ({max_stats_str}) | "
+                    f"Min EV={metrics_min['explained_variance']:.3f} ({min_stats_str})"
                 )
 
         # Save PPOv1 models
@@ -183,6 +217,8 @@ def main():
 
     results_max, results_min, results_rand = evaluate(size_percents, N, X_unit, model_max, model_min)
     results_max_ppov1, results_min_ppov1 = evaluate_ppov1(size_percents, N, X_unit, ppov1_max, ppov1_min)
+    print("PPOv1 Max diversity by size:", dict(zip(size_percents, results_max_ppov1)))
+    print("PPOv1 Min diversity by size:", dict(zip(size_percents, results_min_ppov1)))
     plot_results(size_percents, results_max, results_min, results_rand, "fashion_mnist_plot.png", results_max_ppov1, results_min_ppov1)
 
 if __name__ == "__main__":
