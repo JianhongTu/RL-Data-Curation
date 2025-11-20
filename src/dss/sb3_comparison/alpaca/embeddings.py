@@ -1,42 +1,66 @@
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
+from sentence_transformers import SentenceTransformer
+from datasets import load_dataset
+from pathlib import Path
 
-def flatten_tensor(t: torch.Tensor) -> torch.Tensor:
-    return t.view(-1)
-
-def build_fashion_mnist_embeddings(batch_size: int=512, device: str | None = None):
+def build_alpaca_embeddings(batch_size: int=512, device: str | None = None, cache_dir: str = "./data"):
+  """
+  Build embeddings for the Alpaca dataset using all-mpnet-base-v2.
+  Returns normalized embeddings (unit vectors) for use with cosine distance.
+  
+  Embeddings are cached to disk to avoid recomputing on subsequent runs.
+  """
   if device is None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-  transform = transforms.Compose([
-      transforms.ToTensor(),
-      transforms.Normalize((0.2860,), (0.3530,)),
-      transforms.Lambda(flatten_tensor)
-  ])
+  # Setup cache directory and file
+  cache_path = Path(cache_dir)
+  cache_path.mkdir(exist_ok=True, parents=True)
+  embeddings_file = cache_path / "alpaca_embeddings_mpnet.npz"
+  
+  # Try to load from cache
+  if embeddings_file.exists():
+    print(f"Loading cached embeddings from {embeddings_file}...")
+    cached = np.load(embeddings_file)
+    X_unit_alpaca = cached['embeddings']
+    y = cached['labels']
+    print(f"✓ Loaded {len(X_unit_alpaca)} cached embeddings (dim={X_unit_alpaca.shape[1]})")
+    return X_unit_alpaca, y
+  
+  # Cache miss - compute embeddings
+  print("Cache miss - computing embeddings from scratch...")
+  print("Loading SentenceTransformer model (all-mpnet-base-v2)...")
+  mpnet = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
+  
+  print("Loading Alpaca dataset...")
+  alpaca_ds = load_dataset("yahma/alpaca-cleaned")
+  train_ds = alpaca_ds["train"]
 
-  ds = datasets.FashionMNIST(
-      root="./data",
-      train=True,
-      download=True,
-      transform=transform
-  )
+  print(f"Processing {len(train_ds)} examples...")
+  texts = []
+  for ex in train_ds:
+    instr = ex["instruction"].strip()
+    inp = ex["input"].strip()
+    if inp:
+      txt = instr + " " + inp
+    else:
+      txt = instr
+    texts.append(txt)
 
-  loader = DataLoader(
-      ds,
-      batch_size=batch_size,
-      shuffle=False,
-      num_workers=4,
-      pin_memory=True
-  )
+  print("Encoding texts with all-mpnet-base-v2 (this may take a few minutes)...")
+  X_embed_alpaca = mpnet.encode(texts, batch_size=64, show_progress_bar=True, convert_to_numpy=True).astype(np.float32)
+  
+  print("Normalizing embeddings...")
+  norms = np.linalg.norm(X_embed_alpaca, axis=1, keepdims=True) + 1e-8
+  X_unit_alpaca = (X_embed_alpaca / norms).astype(np.float32)
 
-  X_list, y_list = [], []
-  for imgs, labels in loader:
-    X_list.append(imgs.float().cpu().numpy())
-    y_list.append(labels.long().cpu().numpy())
-
-  X_embed = np.concatenate(X_list, axis=0).astype(np.float32)
-  y = np.concatenate(y_list, axis=0).astype(np.int64)
-
-  return X_embed, y
+  # Return both embeddings and dummy labels (for compatibility)
+  y = np.zeros(len(X_unit_alpaca), dtype=np.int64)
+  
+  # Save to cache
+  print(f"Saving embeddings to cache: {embeddings_file}")
+  np.savez_compressed(embeddings_file, embeddings=X_unit_alpaca, labels=y)
+  print("✓ Embeddings cached for future runs")
+  
+  return X_unit_alpaca, y
