@@ -2,15 +2,22 @@ import numpy as np
 from pathlib import Path
 import wandb
 from wandb.integration.sb3 import WandbCallback
-from envs.diversity_selection_env import DiversitySelectionEnv
-from .embeddings import build_alpaca_embeddings
 from stable_baselines3 import PPO
-from ..eval import evaluate, evaluate_ppov1
-from ..plot import plot_results
-from policies.ppov1 import PPOv1, PPOv1Config
-from compare_ppo_versions import SingleEnvWrapper
 import argparse
 import torch
+import sys
+
+# Add parent directory to path for imports
+dss_path = Path(__file__).resolve().parent.parent.parent
+if str(dss_path) not in sys.path:
+    sys.path.insert(0, str(dss_path))
+
+from envs.diversity_selection_env import DiversitySelectionEnv
+from sb3_comparison.alpaca.embeddings import build_alpaca_embeddings
+from sb3_comparison.eval import evaluate, evaluate_ppov1
+from sb3_comparison.plot import plot_results
+from policies.ppov1 import PPOv1, PPOv1Config
+from compare_ppo_versions import SingleEnvWrapper
 
 def main(debug: bool = False):
     print("=" * 60)
