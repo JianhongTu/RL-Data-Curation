@@ -14,4 +14,6 @@ dependencies = [
     "torchvision>=0.24.0",
     "tqdm>=4.67.1",
     "wandb>=0.23.0",
+    "sentence-transformers>=2.2.0",
+    "datasets>=2.14.0",
 ]
